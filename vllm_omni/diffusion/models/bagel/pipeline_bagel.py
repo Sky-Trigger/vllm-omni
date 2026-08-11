@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
-from copy import deepcopy
+from collections.abc import Iterable, Sequence
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from math import isqrt
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -25,6 +25,10 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -36,6 +40,11 @@ from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
 @dataclass
@@ -168,6 +177,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         "bagel.connector",
         "bagel.vit_pos_embed",
     ]
+    supports_step_execution: ClassVar[bool] = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -347,17 +357,26 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 """This model only supports a single prompt, not a batched request.""",
                 """Taking only the first image for now.""",
             )
+        return self._forward_single(req.prompts[0], req.sampling_params)
+
+    @torch.inference_mode()
+    def _forward_single(
+        self,
+        first_prompt: OmniPromptType,
+        sampling: OmniDiffusionSamplingParams,
+        *,
+        prepare_only: bool = False,
+    ) -> DiffusionOutput | dict[str, Any]:
         # TODO: In online mode, sometimes it receives [{"prompts": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(req.prompts[0], str) else (req.prompts[0].get("prompt") or "")
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
-        if req.sampling_params.height is None and req.sampling_params.width is None:
+        if sampling.height is None and sampling.width is None:
             height = width = max_hw
         else:
-            height = int(req.sampling_params.height) if req.sampling_params.height is not None else max_hw
-            width = int(req.sampling_params.width) if req.sampling_params.width is not None else max_hw
+            height = int(sampling.height) if sampling.height is not None else max_hw
+            width = int(sampling.width) if sampling.width is not None else max_hw
         if height > max_hw or width > max_hw:
             raise ValueError(
                 f"Requested resolution {height}x{width} exceeds Bagel checkpoint limit "
@@ -366,7 +385,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             )
         image_shape = (height, width)
 
-        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        extra_args = getattr(sampling, "extra_args", {}) or {}
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
         cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
 
@@ -375,7 +394,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         cfg_renorm_min = extra_args.get("cfg_renorm_min", 0.0)
 
         gen_params = BagelGenParams(
-            num_timesteps=int(req.sampling_params.num_inference_steps or 50),
+            num_timesteps=int(sampling.num_inference_steps or 50),
             timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
@@ -392,34 +411,30 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         cfg_text_context = deepcopy(gen_context)
         cfg_img_context = deepcopy(gen_context)
 
-        injected_kv = req.sampling_params.past_key_values
+        injected_kv = sampling.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
             injected_kv = NaiveCache.from_object(injected_kv)
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
-            if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
-                gen_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+            if sampling.kv_metadata and "ropes" in sampling.kv_metadata:
+                gen_context["ropes"] = sampling.kv_metadata["ropes"]
             else:
                 gen_context["ropes"] = [seq_len]
 
-            if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
-                image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
+            if sampling.kv_metadata and "image_shape" in sampling.kv_metadata:
+                image_shape = tuple(sampling.kv_metadata["image_shape"])
 
-            branch_kvs = getattr(req.sampling_params, "cfg_branch_past_key_values", None) or {}
-            branch_metadata = getattr(req.sampling_params, "cfg_branch_kv_metadata", None) or {}
-            active_branch = getattr(req.sampling_params, "cfg_active_branch", None)
-            branch_roles = getattr(req.sampling_params, "cfg_branch_roles", None) or list(branch_kvs.keys())
+            branch_kvs = getattr(sampling, "cfg_branch_past_key_values", None) or {}
+            branch_metadata = getattr(sampling, "cfg_branch_kv_metadata", None) or {}
+            active_branch = getattr(sampling, "cfg_active_branch", None)
+            branch_roles = getattr(sampling, "cfg_branch_roles", None) or list(branch_kvs.keys())
 
-            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None) or branch_kvs.get("cfg_text")
-            cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None) or branch_metadata.get(
-                "cfg_text"
-            )
-            cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or branch_kvs.get("cfg_img")
-            cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None) or branch_metadata.get(
-                "cfg_img"
-            )
+            cfg_text_kv = getattr(sampling, "cfg_text_past_key_values", None) or branch_kvs.get("cfg_text")
+            cfg_text_metadata = getattr(sampling, "cfg_text_kv_metadata", None) or branch_metadata.get("cfg_text")
+            cfg_img_kv = getattr(sampling, "cfg_img_past_key_values", None) or branch_kvs.get("cfg_img")
+            cfg_img_metadata = getattr(sampling, "cfg_img_kv_metadata", None) or branch_metadata.get("cfg_img")
 
             cfg_parallel_contract = (
                 active_branch is not None or bool(branch_roles) or cfg_text_kv is not None or cfg_img_kv is not None
@@ -455,8 +470,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 cfg_img_seq_len = injected_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = injected_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
-                if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
-                    cfg_img_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+                if sampling.kv_metadata and "ropes" in sampling.kv_metadata:
+                    cfg_img_context["ropes"] = sampling.kv_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
             else:
@@ -748,10 +763,10 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             )
 
         # ---- Image generation (text2img / img2img) ----
-        if req.sampling_params.seed is not None:
-            torch.manual_seed(req.sampling_params.seed)
+        if sampling.seed is not None:
+            torch.manual_seed(sampling.seed)
             if self.device.type == "cuda":
-                torch.cuda.manual_seed(req.sampling_params.seed)
+                torch.cuda.manual_seed(sampling.seed)
 
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
@@ -787,7 +802,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
         # NOTE: For now we disable device specific noise regeneration so that e2e tests can run
         # on both CUDA and ROCm. Context: https://github.com/vllm-project/vllm-omni/pull/4081
-        # self._regen_init_noise_on_device(generation_input, req.sampling_params.seed)
+        # self._regen_init_noise_on_device(generation_input, sampling.seed)
 
         # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
@@ -808,6 +823,19 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if torch.is_tensor(v):
                 generation_input_cfg_img[k] = v.to(self.device)
 
+        if prepare_only:
+            return {
+                "generation_input": generation_input,
+                "cfg_text_packed_position_ids": generation_input_cfg_text["cfg_packed_position_ids"],
+                "cfg_img_packed_position_ids": generation_input_cfg_img["cfg_packed_position_ids"],
+                "gen_context": gen_context,
+                "cfg_text_context": cfg_text_context,
+                "cfg_img_context": cfg_img_context,
+                "gen_params": gen_params,
+                "image_shape": image_shape,
+                "think_text": think_text,
+            }
+
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
@@ -827,12 +855,33 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 **generation_input,
                 cfg_text_packed_position_ids=generation_input_cfg_text["cfg_packed_position_ids"],
                 cfg_img_packed_position_ids=generation_input_cfg_img["cfg_packed_position_ids"],
-                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                return_trajectory_latents=sampling.return_trajectory_latents,
                 scheduler=self.scheduler,
                 scheduler_kwargs=self.scheduler_kwargs,
             )
 
-        img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+        return self._build_image_output(
+            latents[0],
+            image_shape,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            trajectory_log_probs=trajectory_log_probs,
+            return_trajectory_decoded=sampling.return_trajectory_decoded,
+            think_text=think_text,
+        )
+
+    def _build_image_output(
+        self,
+        latent: torch.Tensor,
+        image_shape: tuple[int, int],
+        *,
+        trajectory_latents: list[torch.Tensor] | None = None,
+        trajectory_timesteps: list[torch.Tensor] | None = None,
+        trajectory_log_probs: list[torch.Tensor] | None = None,
+        return_trajectory_decoded: bool = False,
+        think_text: str | None = None,
+    ) -> DiffusionOutput:
+        img = self._decode_image_from_latent(self.bagel, self.vae, latent, image_shape)
 
         # Build trajectory output when requested
         trajectory_latents_stacked: torch.Tensor | None = None
@@ -841,7 +890,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         if trajectory_latents:
             trajectory_latents_stacked = torch.stack(trajectory_latents)
             trajectory_timesteps_stacked = torch.stack(trajectory_timesteps)
-            if req.sampling_params.return_trajectory_decoded:
+            if return_trajectory_decoded:
                 trajectory_decoded = [
                     self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in trajectory_latents
                 ]
@@ -873,6 +922,318 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 "metadata": metadata,
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
+    def prepare_encode(
+        self,
+        state: StepRequestState,
+        **kwargs: object,
+    ) -> StepRequestState:
+        """Populate *state* with BAGEL inputs, latents, timesteps, and CFG config."""
+        del kwargs
+        sampling = state.sampling
+        prompt = state.prompt if state.prompt is not None else ""
+        if isinstance(prompt, dict):
+            if "text" in (prompt.get("modalities") or []):
+                raise NotImplementedError("BAGEL text output is not supported by step execution.")
+
+        ctx = self._forward_single(prompt, sampling, prepare_only=True)
+        if not isinstance(ctx, dict):
+            raise RuntimeError("BAGEL step preparation did not produce an image-generation context.")
+
+        generation_input = ctx["generation_input"]
+        latents = generation_input["packed_init_noises"]
+        gen_params = ctx["gen_params"]
+        timesteps, dts = self.bagel.prepare_denoise_schedule(
+            latents,
+            gen_params.num_timesteps,
+            gen_params.timestep_shift,
+        )
+        if len(timesteps) == 0:
+            raise ValueError("BAGEL step execution requires num_inference_steps >= 2.")
+
+        # Keep request-local scheduler progress while sharing immutable config
+        # and tensor buffers with the pipeline scheduler.
+        req_scheduler = copy(self.scheduler)
+
+        # Populate state from generation context.
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = gen_params.cfg_text_scale > 1.0
+        state.img_shapes = [ctx["image_shape"]]
+        state.extra.update(
+            {
+                "bagel_generation_input": {
+                    key: value for key, value in generation_input.items() if key != "packed_init_noises"
+                },
+                "bagel_cfg_text_packed_position_ids": ctx["cfg_text_packed_position_ids"],
+                "bagel_cfg_img_packed_position_ids": ctx["cfg_img_packed_position_ids"],
+                "bagel_gen_context": ctx["gen_context"],
+                "bagel_cfg_text_context": ctx["cfg_text_context"],
+                "bagel_cfg_img_context": ctx["cfg_img_context"],
+                "bagel_gen_params": gen_params,
+                "bagel_dts": dts,
+                "bagel_image_shape": ctx["image_shape"],
+                "bagel_scheduler_kwargs": dict(self.scheduler_kwargs),
+                "bagel_think_text": ctx["think_text"],
+                "bagel_trajectory_latents": (
+                    # Trajectory output needs immutable snapshots because each
+                    # later scheduler update replaces or mutates the latents.
+                    [latents.clone()] if sampling.return_trajectory_latents and len(timesteps) > 0 else []
+                ),
+                "bagel_trajectory_timesteps": [],
+                "bagel_trajectory_log_probs": [],
+            }
+        )
+        return state
+
+    @staticmethod
+    def _pack_step_generation_inputs(
+        states: Sequence[StepRequestState],
+    ) -> dict[str, torch.Tensor]:
+        generation_inputs = [state.extra["bagel_generation_input"] for state in states]
+        packed_seqlens = [generation_input["packed_seqlens"] for generation_input in generation_inputs]
+        if any(seqlens.numel() != 1 for seqlens in packed_seqlens):
+            raise ValueError("BAGEL step execution expects one packed sequence per request.")
+        seq_lengths = [int(seqlens.item()) for seqlens in packed_seqlens]
+        if len(set(seq_lengths)) != 1:
+            raise ValueError("BAGEL step batching requires matching packed sequence lengths.")
+
+        query_offset = 0
+        text_indexes = []
+        vae_indexes = []
+        for generation_input, seq_len in zip(generation_inputs, seq_lengths, strict=True):
+            text_indexes.append(generation_input["packed_text_indexes"] + query_offset)
+            vae_indexes.append(generation_input["packed_vae_token_indexes"] + query_offset)
+            query_offset += seq_len
+
+        return {
+            "packed_text_ids": torch.cat([item["packed_text_ids"] for item in generation_inputs]),
+            "packed_text_indexes": torch.cat(text_indexes),
+            "packed_vae_position_ids": torch.cat([item["packed_vae_position_ids"] for item in generation_inputs]),
+            "packed_vae_token_indexes": torch.cat(vae_indexes),
+            "packed_seqlens": torch.cat(packed_seqlens),
+            "packed_position_ids": torch.cat([item["packed_position_ids"] for item in generation_inputs]),
+        }
+
+    def _build_denoise_kwargs(
+        self,
+        input_batch: InputBatch,
+        states: Sequence[StepRequestState],
+    ) -> dict[str, Any]:
+        if self.bagel._sp_size > 1:
+            raise NotImplementedError("BAGEL step execution does not currently support sequence parallelism.")
+        parallel_config = getattr(self.bagel, "parallel_config", None)
+        cfg_parallel_size = getattr(parallel_config, "cfg_parallel_size", 1)
+
+        packed = self._pack_step_generation_inputs(states)
+        vae_lengths = [int(state.latents.shape[0]) for state in states]
+        if sum(vae_lengths) != int(input_batch.latents.shape[0]):
+            raise ValueError("BAGEL packed latent rows do not match InputBatch.latents.")
+
+        renorm_settings = {
+            (
+                state.extra["bagel_gen_params"].cfg_renorm_type,
+                state.extra["bagel_gen_params"].cfg_renorm_min,
+            )
+            for state in states
+        }
+        if len(renorm_settings) != 1:
+            raise ValueError("Mixed BAGEL CFG renormalization settings cannot share one step batch.")
+        cfg_renorm_type, cfg_renorm_min = next(iter(renorm_settings))
+
+        cfg_text_scales = []
+        cfg_img_scales = []
+        for state in states:
+            gen_params = state.extra["bagel_gen_params"]
+            timestep = state.current_timestep
+            if timestep is None:
+                raise ValueError(f"BAGEL request {state.request_id} has no current timestep.")
+            t_value = float(timestep.item())
+            in_cfg_window = t_value > gen_params.cfg_interval[0] and t_value <= gen_params.cfg_interval[1]
+            text_scale = gen_params.cfg_text_scale if in_cfg_window else 1.0
+            cfg_text_scales.append(text_scale)
+            cfg_img_scales.append(gen_params.cfg_img_scale if in_cfg_window and text_scale > 1.0 else 1.0)
+
+        use_cfg_text = any(scale > 1.0 for scale in cfg_text_scales)
+        use_cfg_img = use_cfg_text and any(scale > 1.0 for scale in cfg_img_scales)
+        configured_cfg_text = any(state.extra["bagel_gen_params"].cfg_text_scale > 1.0 for state in states)
+        configured_cfg_img = any(
+            state.extra["bagel_gen_params"].cfg_text_scale > 1.0 and state.extra["bagel_gen_params"].cfg_img_scale > 1.0
+            for state in states
+        )
+        build_cfg_text = use_cfg_text or (cfg_parallel_size > 1 and configured_cfg_text)
+        build_cfg_img = use_cfg_img or (cfg_parallel_size > 1 and configured_cfg_img)
+        gen_cache = NaiveCache.merge([state.extra["bagel_gen_context"]["past_key_values"] for state in states])
+        cfg_branch_pids = None
+        cfg_branch_caches = None
+        if build_cfg_text:
+            cfg_branch_pids = [
+                packed["packed_position_ids"],
+                torch.cat([state.extra["bagel_cfg_text_packed_position_ids"] for state in states]),
+            ]
+            cfg_branch_caches = [
+                gen_cache,
+                NaiveCache.merge([state.extra["bagel_cfg_text_context"]["past_key_values"] for state in states]),
+            ]
+            if build_cfg_img:
+                cfg_branch_pids.append(
+                    torch.cat([state.extra["bagel_cfg_img_packed_position_ids"] for state in states])
+                )
+                cfg_branch_caches.append(
+                    NaiveCache.merge([state.extra["bagel_cfg_img_context"]["past_key_values"] for state in states])
+                )
+
+        return {
+            "x_t": input_batch.latents,
+            "timestep": input_batch.timesteps,
+            "past_key_values": gen_cache,
+            "cfg_renorm_min": cfg_renorm_min,
+            "cfg_renorm_type": cfg_renorm_type,
+            "cfg_text_scale": max(cfg_text_scales),
+            "cfg_img_scale": max(cfg_img_scales),
+            "cfg_branch_pids": cfg_branch_pids,
+            "cfg_branch_caches": cfg_branch_caches,
+            "cfg_vae_lengths": vae_lengths if use_cfg_text else None,
+            "cfg_text_scales": cfg_text_scales if use_cfg_text else None,
+            "cfg_img_scales": cfg_img_scales if use_cfg_text else None,
+            **packed,
+        }
+
+    def _denoise_step_cfg_parallel(self, denoise_kwargs: dict[str, Any]) -> torch.Tensor:
+        cfg_branch_pids = denoise_kwargs["cfg_branch_pids"]
+        cfg_branch_caches = denoise_kwargs["cfg_branch_caches"]
+        if cfg_branch_pids is None or cfg_branch_caches is None:
+            return self.bagel.forward(**denoise_kwargs)
+
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        num_branches = len(cfg_branch_pids)
+        if cfg_world_size == 3 and num_branches == 2:
+            raise ValueError(
+                "cfg_parallel_size=3 requires cfg_img_scale > 1.0. "
+                "Use cfg_parallel_size=2 for text-only CFG parallel, or set cfg_img_scale > 1.0."
+            )
+        if cfg_world_size == 2 and num_branches == 3:
+            raise ValueError(
+                f"Image CFG (cfg_img_scale={denoise_kwargs['cfg_img_scale']}) requires cfg_parallel_size=3, "
+                "but got cfg_parallel_size=2. Use cfg_parallel_size=3 to enable image CFG in parallel mode."
+            )
+
+        common_keys = (
+            "x_t",
+            "timestep",
+            "packed_vae_token_indexes",
+            "packed_vae_position_ids",
+            "packed_text_ids",
+            "packed_text_indexes",
+            "packed_seqlens",
+        )
+        common = {key: denoise_kwargs[key] for key in common_keys}
+        branches_kwargs = [
+            {**common, "packed_position_ids": position_ids, "past_key_values": cache}
+            for position_ids, cache in zip(cfg_branch_pids, cfg_branch_caches, strict=True)
+        ]
+        result = self.bagel.predict_noise_with_multi_branch_cfg(
+            do_true_cfg=denoise_kwargs["cfg_text_scales"] is not None,
+            true_cfg_scale={
+                "cfg_text_scale": denoise_kwargs["cfg_text_scale"],
+                "cfg_img_scale": denoise_kwargs["cfg_img_scale"],
+                "cfg_renorm_type": denoise_kwargs["cfg_renorm_type"],
+                "cfg_renorm_min": denoise_kwargs["cfg_renorm_min"],
+                "cfg_vae_lengths": denoise_kwargs["cfg_vae_lengths"],
+                "cfg_text_scales": denoise_kwargs["cfg_text_scales"],
+                "cfg_img_scales": denoise_kwargs["cfg_img_scales"],
+            },
+            branches_kwargs=branches_kwargs,
+        )
+        if not isinstance(result, torch.Tensor):
+            raise TypeError("BAGEL CFG parallel step must return one velocity tensor.")
+        return result
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """One denoise step: pack request-local BAGEL state and run the model."""
+        del kwargs
+        states = tuple(states or input_batch.states)
+        if not states:
+            raise ValueError("BAGEL denoise_step requires at least one request state.")
+        denoise_kwargs = self._build_denoise_kwargs(input_batch, states)
+        parallel_config = getattr(self.bagel, "parallel_config", None)
+        use_cfg_parallel = (
+            getattr(parallel_config, "cfg_parallel_size", 1) > 1 and denoise_kwargs["cfg_branch_pids"] is not None
+        )
+
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            if use_cfg_parallel:
+                if any(state.step_index == 0 for state in states):
+                    get_cfg_group().broadcast(input_batch.latents, src=0)
+                return self._denoise_step_cfg_parallel(denoise_kwargs)
+            return self.bagel.forward(**denoise_kwargs)
+
+    def step_scheduler(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: object,
+    ) -> None:
+        """One scheduler step: update ``state.latents`` and advance ``step_index``."""
+        del kwargs
+        t = state.current_timestep
+        if t is None or state.latents is None:
+            raise ValueError(f"BAGEL request {state.request_id} is not ready for a scheduler step.")
+        dt = state.extra["bagel_dts"][state.step_index]
+        log_prob = None
+        if state.scheduler is not None:
+            output = state.scheduler.step(
+                noise_pred.to(state.latents.device),
+                t,
+                state.latents,
+                dt,
+                **state.extra["bagel_scheduler_kwargs"],
+            )
+            state.latents = output.prev_sample
+            log_prob = getattr(output, "log_prob", None)
+        else:
+            state.latents = state.latents - noise_pred.to(state.latents.device) * dt
+
+        if state.sampling.return_trajectory_latents:
+            # Preserve this opt-in step snapshot before the next update.
+            state.extra["bagel_trajectory_latents"].append(state.latents.clone())
+            state.extra["bagel_trajectory_timesteps"].append(t)
+            if log_prob is not None:
+                state.extra["bagel_trajectory_log_probs"].append(log_prob)
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: StepRequestState,
+        **kwargs: object,
+    ) -> DiffusionOutput:
+        """Decode final latents from *state*."""
+        del kwargs
+        if state.latents is None:
+            raise ValueError(f"BAGEL request {state.request_id} has no latents to decode.")
+        image_shape = state.extra["bagel_image_shape"]
+        return_trajectory_decoded = state.sampling.return_trajectory_decoded
+        return self._build_image_output(
+            state.latents,
+            image_shape,
+            trajectory_latents=state.extra["bagel_trajectory_latents"],
+            trajectory_timesteps=state.extra["bagel_trajectory_timesteps"],
+            trajectory_log_probs=state.extra["bagel_trajectory_log_probs"],
+            return_trajectory_decoded=return_trajectory_decoded,
+            think_text=state.extra["bagel_think_text"],
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
