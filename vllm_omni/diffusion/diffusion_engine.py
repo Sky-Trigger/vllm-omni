@@ -950,9 +950,9 @@ class DiffusionEngine:
         width: int,
         guidance_scale: float,
         num_image_inputs: int = 1,
+        num_inference_steps: int = 1,
     ) -> OmniDiffusionRequest | None:
-        """Build a one-step model request for startup profiling or warmup."""
-
+        """Build a minimal model request for startup profiling or warmup."""
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
@@ -973,7 +973,7 @@ class DiffusionEngine:
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=1,
+                num_inference_steps=num_inference_steps,
                 num_frames=num_frames,
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
@@ -1044,6 +1044,10 @@ class DiffusionEngine:
             height=512,
             width=512,
             guidance_scale=0.0,
+            # Step execution must exercise at least one denoising iteration.
+            # Some pipelines (for example BAGEL) perform
+            # ``num_inference_steps - 1`` scheduler updates.
+            num_inference_steps=2 if self.step_execution else 1,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")
