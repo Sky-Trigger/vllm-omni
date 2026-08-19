@@ -82,6 +82,14 @@ class MoTRMSNorm(CustomOp):
             eps=self.variance_epsilon,
         )
 
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        text_indices: torch.Tensor | None = None,
+        vae_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward_native(x, text_indices, vae_indices)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
