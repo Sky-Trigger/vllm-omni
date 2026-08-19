@@ -150,8 +150,11 @@ that do not belong in the shared contract should be stored in `state.extra`.
 Queueing and lifecycle metadata remain in the scheduler's request state.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, HunyuanImage3, and Helios. Step execution alone does not imply
-continuous-batching support: Qwen-Image accepts batched step states.
+Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
+imply continuous-batching support: Qwen-Image accepts batched step states.
+BAGEL accepts batched step states for image generation with its single-stage
+pipeline and requires at least two inference steps because it schedules
+`num_inference_steps - 1` denoising updates.
 HunyuanImage3 accepts batched step states only when its resolved self-attention
 backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
 Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or

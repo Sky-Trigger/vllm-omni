@@ -94,15 +94,18 @@ validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
 Step execution is capability-based, not a generic switch for every diffusion
-model. Qwen-Image supports step-wise continuous batching. HunyuanImage3 also
-supports it, but only when its resolved self-attention backend is `TORCH_SDPA`;
+model. Qwen-Image supports step-wise continuous batching. BAGEL supports
+step-wise continuous batching for image generation with its single-stage
+pipeline; use at least two inference steps because BAGEL schedules
+`num_inference_steps - 1` denoising updates. HunyuanImage3 also supports it,
+but only when its resolved self-attention backend is `TORCH_SDPA`;
 set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `diffusion_attention_config.default.backend=TORCH_SDPA` before using
 `--max-num-seqs >1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
-for its validated configuration. Helios supports single-request step execution only: use
-`--step-execution --max-num-seqs 1` for Helios. Consult the selected pipeline's
-documentation and source for the latest support status.
+for its validated configuration. Helios supports single-request step execution
+only: use `--step-execution --max-num-seqs 1` for Helios. Consult the selected
+pipeline's documentation and source for the latest support status.
 
 ## Streaming Output
 

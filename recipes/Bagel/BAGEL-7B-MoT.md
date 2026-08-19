@@ -156,6 +156,67 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
   --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 ```
 
+#### Step Execution and Continuous Batching
+
+BAGEL supports step execution for image generation with the single-stage
+topology. Start with one active request when validating correctness:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT \
+  --omni \
+  --port 8091 \
+  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
+  --step-execution
+```
+
+To let compatible requests share denoising waves, override the stage capacity.
+The deploy file sets `max_num_seqs: 1`, so its per-stage value takes precedence
+over the global `--max-num-seqs` flag:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT \
+  --omni \
+  --port 8091 \
+  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
+  --step-execution \
+  --stage-overrides '{"0":{"max_num_seqs":4}}'
+```
+
+Step execution currently covers BAGEL image generation in the single-stage
+pipeline; text output is not supported in this mode. Use at least two inference
+steps. BAGEL builds `num_inference_steps - 1` scheduler updates, so a one-step
+request has no denoising iteration to schedule.
+
+For a matched throughput comparison, start the first server with the default
+stage capacity of one and run:
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+  --base-url http://localhost:8091 \
+  --endpoint /v1/chat/completions \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --task t2i \
+  --dataset random \
+  --num-prompts 20 \
+  --max-concurrency 4 \
+  --width 512 \
+  --height 512 \
+  --num-inference-steps 20 \
+  --seed 42 \
+  --warmup-requests 4 \
+  --warmup-concurrency 4 \
+  --warmup-num-inference-steps 2 \
+  --output-file /tmp/bagel_step_seq1.json \
+  --disable-tqdm
+```
+
+Restart the server with `--stage-overrides
+'{"0":{"max_num_seqs":4}}'`, rerun the same benchmark with
+`--output-file /tmp/bagel_step_seq4.json`, and compare completed requests,
+duration, throughput, and latency percentiles. Keep the model, device topology,
+request count, client concurrency, resolution, steps, seed, and warmup settings
+fixed between runs.
+
 Send a text-to-image request with BAGEL-specific generation parameters:
 
 ```bash
