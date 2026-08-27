@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from PIL import Image
+from safetensors.torch import save_file
 from torch import nn
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, NaiveCache
@@ -19,6 +21,7 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     get_bagel_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -87,6 +90,77 @@ def test_bagel_step_preprocessor_defaults_to_non_step_when_omitted():
 
     assert pre_process(request) is request
     assert request.use_step_execution is True
+
+
+@pytest.mark.parametrize(
+    ("first_extra_args", "second_extra_args"),
+    [
+        ({"cfg_text_scale": 1.0}, {"cfg_text_scale": 4.0}),
+        ({"cfg_img_scale": 1.0}, {"cfg_img_scale": 1.5}),
+        ({"cfg_interval": (0.0, 1.0)}, {"cfg_interval": (0.4, 1.0)}),
+        ({"cfg_renorm_type": "global"}, {"cfg_renorm_type": "channel"}),
+        ({"cfg_renorm_min": 0.0}, {"cfg_renorm_min": 0.5}),
+    ],
+)
+def test_bagel_step_preprocessor_separates_incompatible_cfg_settings(first_extra_args, second_extra_args):
+    pre_process = get_bagel_pre_process_func(types.SimpleNamespace(step_execution=True))
+    requests = [
+        OmniDiffusionRequest(
+            prompt={"prompt": "draw a cat", "modalities": ["image"]},
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, extra_args=extra_args),
+            request_id=request_id,
+        )
+        for request_id, extra_args in (("a", first_extra_args), ("b", second_extra_args))
+    ]
+
+    first, second = (pre_process(request) for request in requests)
+
+    assert first.batch_compatibility_key != second.batch_compatibility_key
+
+
+def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"vae_config":{"downsample":8},"latent_patch_size":2,"max_latent_size":32}',
+        encoding="utf-8",
+    )
+    save_file(
+        {"latent_pos_embed.pos_embed": torch.zeros(64 * 64, 1)},
+        tmp_path / "ema.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"latent_pos_embed.pos_embed":"ema.safetensors"}}',
+        encoding="utf-8",
+    )
+    pre_process = get_bagel_pre_process_func(
+        types.SimpleNamespace(model=str(tmp_path), revision=None, step_execution=True)
+    )
+    requests = [
+        OmniDiffusionRequest(
+            prompt={
+                "prompt": "edit this image",
+                "modalities": ["img2img"],
+                "multi_modal_data": {"img2img": Image.new("RGB", size)},
+            },
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+            request_id=request_id,
+        )
+        for request_id, size in (("a", (800, 400)), ("b", (1024, 512)))
+    ]
+    first, second = (pre_process(request) for request in requests)
+
+    assert (first.sampling_params.height, first.sampling_params.width) == (400, 800)
+    assert (second.sampling_params.height, second.sampling_params.width) == (512, 1024)
+
+    scheduler = StepScheduler()
+    scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    schedule = scheduler.schedule()
+
+    assert schedule.scheduled_request_ids == ["a"]
+    assert schedule.num_running_reqs == 1
+    assert schedule.num_waiting_reqs == 1
 
 
 def _cache(length: int, value: float, num_layers: int = 1) -> NaiveCache:
@@ -286,6 +360,21 @@ def test_denoise_step_uses_one_forward_and_preserves_request_kv_lengths():
     assert call["cfg_branch_caches"][1].key_values_lens == [3, 4]
     assert call["cfg_vae_lengths"] == [4, 4]
     assert len(call["cfg_branch_pids"]) == 3
+
+
+def test_denoise_step_rejects_mixed_cfg_settings_defensively():
+    states = [
+        _prepare_state("a", kv_len=2, cfg_text_scale=2.0),
+        _prepare_state("b", kv_len=3, cfg_text_scale=4.0),
+    ]
+    input_batch = InputBatch.make_batch(states)
+    pipeline = MagicMock()
+    pipeline.bagel.parallel_config = _ParallelConfig(cfg_parallel_size=1)
+    pipeline._pack_step_generation_inputs = BagelPipeline._pack_step_generation_inputs
+    pipeline._build_denoise_kwargs = types.MethodType(BagelPipeline._build_denoise_kwargs, pipeline)
+
+    with pytest.raises(ValueError, match="Mixed BAGEL CFG settings"):
+        pipeline._build_denoise_kwargs(input_batch, states)
 
 
 def test_denoise_step_dispatches_three_cfg_parallel_branches():
@@ -589,7 +678,7 @@ def test_bagel_forward_skips_cfg_without_branch_contexts(cfg_kwargs):
     assert torch.equal(result, torch.ones(2, 2))
 
 
-def test_bagel_forward_combines_cfg_per_request_in_one_model_call():
+def test_bagel_forward_combines_same_cfg_per_request_in_one_model_call():
     bagel = Bagel.__new__(Bagel)
     nn.Module.__init__(bagel)
     bagel.hidden_size = 2
@@ -619,16 +708,16 @@ def test_bagel_forward_combines_cfg_per_request_in_one_model_call():
         ],
         cfg_branch_caches=[NaiveCache(1), NaiveCache(1)],
         cfg_vae_lengths=[2, 2],
-        cfg_text_scales=[2.0, 3.0],
+        cfg_text_scales=[3.0, 3.0],
         cfg_img_scales=[1.0, 1.0],
     )
 
     assert bagel.language_model.denoise_calls == 1
-    assert torch.equal(result[:2], torch.full((2, 2), 2.0))
+    assert torch.equal(result[:2], torch.full((2, 2), 3.0))
     assert torch.equal(result[2:], torch.full((2, 2), 6.0))
 
 
-def test_multi_branch_cfg_combines_each_request_independently():
+def test_multi_branch_cfg_combines_same_cfg_for_each_request_independently():
     bagel = Bagel.__new__(Bagel)
     nn.Module.__init__(bagel)
     positive = torch.tensor([[1.0], [1.0], [2.0], [2.0]])
@@ -642,10 +731,10 @@ def test_multi_branch_cfg_combines_each_request_independently():
             "cfg_renorm_type": "global",
             "cfg_renorm_min": 1.0,
             "cfg_vae_lengths": [2, 2],
-            "cfg_text_scales": [2.0, 3.0],
+            "cfg_text_scales": [3.0, 3.0],
             "cfg_img_scales": [1.0, 1.0],
         },
     )
 
-    assert torch.equal(result[:2], torch.full((2, 1), 2.0))
+    assert torch.equal(result[:2], torch.full((2, 1), 3.0))
     assert torch.equal(result[2:], torch.full((2, 1), 6.0))

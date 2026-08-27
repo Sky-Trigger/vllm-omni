@@ -77,6 +77,11 @@ class StepBatchSamplingParamsKey:
     # not mix it with state-driven denoising in one scheduler wave.
     use_step_execution: bool = True
 
+    # Pipeline-specific structure populated during preprocessing. This keeps
+    # model-owned settings that must be homogeneous (for example BAGEL CFG
+    # scales and renormalization) out of the generic sampling-params schema.
+    condition_key: tuple[Any, ...] | None = None
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1

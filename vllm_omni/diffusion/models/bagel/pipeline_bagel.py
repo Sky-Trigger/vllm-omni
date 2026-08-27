@@ -105,12 +105,133 @@ def get_bagel_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _resolve_bagel_image_geometry(od_config: OmniDiffusionConfig) -> tuple[int, int]:
+    """Return the effective ``(latent_downsample, max_latent_size)``.
+
+    Some BAGEL checkpoints advertise a stale ``max_latent_size`` in
+    ``config.json``.  Model loading already corrects it from the positional
+    embedding weight, so admission preprocessing must do the same or it can
+    compute a different img2img shape from the Worker.
+    """
+
+    model = getattr(od_config, "model", None)
+    if not model:
+        raise ValueError("BAGEL img2img preprocessing requires od_config.model.")
+    if os.path.exists(model):
+        model_path = model
+    else:
+        model_path = download_weights_from_hf_specific(
+            model,
+            None,
+            ["*"],
+            revision=getattr(od_config, "revision", None),
+        )
+
+    config_path = os.path.join(model_path, "config.json")
+    with open(config_path, encoding="utf-8") as f:
+        bagel_cfg = json.load(f)
+
+    vae_config = bagel_cfg.get("vae_config") or {}
+    latent_downsample = int(vae_config.get("downsample", 8)) * int(bagel_cfg.get("latent_patch_size", 2))
+    max_latent_size = int(bagel_cfg.get("max_latent_size", 32))
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map") or {}
+        position_key = next(
+            (key for key in ("latent_pos_embed.pos_embed", "bagel.latent_pos_embed.pos_embed") if key in weight_map),
+            None,
+        )
+        if position_key is not None:
+            from safetensors import safe_open
+
+            shard_path = os.path.join(model_path, weight_map[position_key])
+            with safe_open(shard_path, framework="pt") as f:
+                num_positions = int(f.get_slice(position_key).get_shape()[0])
+            inferred_size = isqrt(num_positions)
+            if inferred_size * inferred_size != num_positions:
+                raise ValueError(f"BAGEL latent position embedding length must be a square, got {num_positions}.")
+            max_latent_size = inferred_size
+
+    return latent_downsample, max_latent_size
+
+
+def _bagel_effective_image_size(
+    image_size: tuple[int, int],
+    *,
+    latent_downsample: int,
+    max_latent_size: int,
+) -> tuple[int, int]:
+    """Match BAGEL's img2img resize and return ``(height, width)``."""
+
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"BAGEL img2img input must have positive dimensions, got {width}x{height}.")
+
+    max_image_size = int(max_latent_size * latent_downsample)
+    scale = min(max_image_size / max(width, height), 1.0)
+    min_image_size = min(256, max_image_size)
+    scale = max(scale, min_image_size / min(width, height))
+    resized_width = max(
+        latent_downsample,
+        int(round(width * scale / latent_downsample) * latent_downsample),
+    )
+    resized_height = max(
+        latent_downsample,
+        int(round(height * scale / latent_downsample) * latent_downsample),
+    )
+    return min(resized_height, max_image_size), min(resized_width, max_image_size)
+
+
 def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
-    """Keep explicit BAGEL text requests on their existing full-forward path."""
+    """Resolve BAGEL execution mode and step-batch compatibility."""
 
     step_execution = bool(getattr(od_config, "step_execution", False))
+    image_geometry: tuple[int, int] | None = None
 
     def pre_process_func(request: OmniDiffusionRequest):
+        nonlocal image_geometry
+
+        sampling = request.sampling_params
+        kv_metadata = getattr(sampling, "kv_metadata", None) or {}
+        image_shape = kv_metadata.get("image_shape")
+        if image_shape is not None:
+            sampling.height, sampling.width = (int(value) for value in image_shape)
+        elif isinstance(request.prompt, dict):
+            modalities = request.prompt.get("modalities") or []
+            multi_modal_data = request.prompt.get("multi_modal_data") or {}
+            image_input = multi_modal_data.get("img2img")
+            if image_input is None and "text" not in modalities:
+                image_input = multi_modal_data.get("image")
+            if isinstance(image_input, list):
+                image_input = image_input[0] if image_input else None
+            if image_input is not None:
+                if isinstance(image_input, str):
+                    with Image.open(image_input) as image:
+                        input_size = image.size
+                else:
+                    input_size = image_input.size
+                if image_geometry is None:
+                    image_geometry = _resolve_bagel_image_geometry(od_config)
+                latent_downsample, max_latent_size = image_geometry
+                sampling.height, sampling.width = _bagel_effective_image_size(
+                    input_size,
+                    latent_downsample=latent_downsample,
+                    max_latent_size=max_latent_size,
+                )
+
+        extra_args = request.sampling_params.extra_args or {}
+        cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
+        request.batch_compatibility_key = (
+            "bagel_cfg",
+            float(extra_args.get("cfg_text_scale", 4.0)),
+            float(extra_args.get("cfg_img_scale", 1.5)),
+            cfg_interval,
+            extra_args.get("cfg_renorm_type", "global"),
+            float(extra_args.get("cfg_renorm_min", 0.0)),
+        )
+
         # Preserve legacy plain-string behavior: only an explicit modality
         # request selects Bagel.generate_text() instead of stepwise denoising.
         if step_execution and isinstance(request.prompt, dict):
@@ -1052,16 +1173,19 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         if sum(vae_lengths) != int(input_batch.latents.shape[0]):
             raise ValueError("BAGEL packed latent rows do not match InputBatch.latents.")
 
-        renorm_settings = {
+        cfg_settings = {
             (
+                state.extra["bagel_gen_params"].cfg_text_scale,
+                state.extra["bagel_gen_params"].cfg_img_scale,
+                tuple(state.extra["bagel_gen_params"].cfg_interval),
                 state.extra["bagel_gen_params"].cfg_renorm_type,
                 state.extra["bagel_gen_params"].cfg_renorm_min,
             )
             for state in states
         }
-        if len(renorm_settings) != 1:
-            raise ValueError("Mixed BAGEL CFG renormalization settings cannot share one step batch.")
-        cfg_renorm_type, cfg_renorm_min = next(iter(renorm_settings))
+        if len(cfg_settings) != 1:
+            raise ValueError("Mixed BAGEL CFG settings cannot share one step batch.")
+        cfg_text_scale, cfg_img_scale, _cfg_interval, cfg_renorm_type, cfg_renorm_min = next(iter(cfg_settings))
 
         cfg_text_scales = []
         cfg_img_scales = []
@@ -1111,8 +1235,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             "past_key_values": gen_cache,
             "cfg_renorm_min": cfg_renorm_min,
             "cfg_renorm_type": cfg_renorm_type,
-            "cfg_text_scale": max(cfg_text_scales),
-            "cfg_img_scale": max(cfg_img_scales),
+            "cfg_text_scale": cfg_text_scale,
+            "cfg_img_scale": cfg_img_scale,
             "cfg_branch_pids": cfg_branch_pids,
             "cfg_branch_caches": cfg_branch_caches,
             "cfg_vae_lengths": vae_lengths if use_cfg_text else None,
