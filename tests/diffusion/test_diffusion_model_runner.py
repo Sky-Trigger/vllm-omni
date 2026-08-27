@@ -221,6 +221,69 @@ def _make_compile_runner(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_stepwise_falls_back_to_full_forward_without_creating_step_state(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestDiffusionOutputPipeline()
+    request = _make_request()
+    request.request_id = "text-request"
+    request.use_step_execution = False
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=request.request_id,
+                req=request,
+                diffusion_kv_metadata=None,
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    output = result.get_request_output(request.request_id)
+
+    assert output.finished is True
+    assert output.step_index == 0
+    assert output.result is not None
+    assert output.result.output == request.prompt
+    assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
+    assert runner.pipeline.last_req.num_reqs == 1
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_rejects_mixed_step_and_full_forward_batch():
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    non_step_request = _make_request()
+    non_step_request.use_step_execution = False
+    step_request = _make_request()
+    step_request.request_id = "step-request"
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=non_step_request.request_id,
+                req=non_step_request,
+                diffusion_kv_metadata=None,
+            ),
+            SimpleNamespace(
+                request_id=step_request.request_id,
+                req=step_request,
+                diffusion_kv_metadata=None,
+            ),
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    with pytest.raises(ValueError, match="Cannot mix stepwise and non-step fallback"):
+        DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_update_states_carries_prepared_layout() -> None:
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     request = _make_request()

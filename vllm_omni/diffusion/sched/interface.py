@@ -73,6 +73,10 @@ class StepBatchSamplingParamsKey:
     # because model acceleration hooks are shared by the whole worker batch.
     quality: str | None = None
 
+    # Step-mode engines can admit a model-specific full-forward fallback. Do
+    # not mix it with state-driven denoising in one scheduler wave.
+    use_step_execution: bool = True
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1

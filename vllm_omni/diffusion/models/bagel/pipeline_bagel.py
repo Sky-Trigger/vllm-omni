@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -102,6 +103,23 @@ def get_bagel_post_process_func(od_config: OmniDiffusionConfig):
         return x
 
     return post_process_func
+
+
+def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
+    """Keep explicit BAGEL text requests on their existing full-forward path."""
+
+    step_execution = bool(getattr(od_config, "step_execution", False))
+
+    def pre_process_func(request: OmniDiffusionRequest):
+        # Preserve legacy plain-string behavior: only an explicit modality
+        # request selects Bagel.generate_text() instead of stepwise denoising.
+        if step_execution and isinstance(request.prompt, dict):
+            modalities = request.prompt.get("modalities") or []
+            if "text" in modalities:
+                request.use_step_execution = False
+        return request
+
+    return pre_process_func
 
 
 @dataclass
@@ -931,6 +949,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
     ) -> StepRequestState:
         """Populate *state* with BAGEL inputs, latents, timesteps, and CFG config."""
         del kwargs
+        if self.bagel._sp_size > 1:
+            raise NotImplementedError("BAGEL step execution does not currently support sequence parallelism.")
+
         sampling = state.sampling
         prompt = state.prompt if state.prompt is not None else ""
         if isinstance(prompt, dict):
@@ -1023,8 +1044,6 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         input_batch: InputBatch,
         states: Sequence[StepRequestState],
     ) -> dict[str, Any]:
-        if self.bagel._sp_size > 1:
-            raise NotImplementedError("BAGEL step execution does not currently support sequence parallelism.")
         parallel_config = getattr(self.bagel, "parallel_config", None)
         cfg_parallel_size = getattr(parallel_config, "cfg_parallel_size", 1)
 
@@ -1110,11 +1129,6 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
         cfg_world_size = get_classifier_free_guidance_world_size()
         num_branches = len(cfg_branch_pids)
-        if cfg_world_size == 3 and num_branches == 2:
-            raise ValueError(
-                "cfg_parallel_size=3 requires cfg_img_scale > 1.0. "
-                "Use cfg_parallel_size=2 for text-only CFG parallel, or set cfg_img_scale > 1.0."
-            )
         if cfg_world_size == 2 and num_branches == 3:
             raise ValueError(
                 f"Image CFG (cfg_img_scale={denoise_kwargs['cfg_img_scale']}) requires cfg_parallel_size=3, "

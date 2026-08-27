@@ -13,9 +13,15 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, NaiveCache
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelGenParams, BagelPipeline
+from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
+    BagelGenParams,
+    BagelPipeline,
+    get_bagel_pre_process_func,
+)
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -49,6 +55,38 @@ def _sampling(*, trajectory: bool = False) -> _Sampling:
     return _Sampling(
         return_trajectory_latents=trajectory,
     )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "use_step_execution"),
+    [
+        ({"prompt": "describe this image", "modalities": ["text"]}, False),
+        ({"prompt": "draw a cat", "modalities": ["image"]}, True),
+        ("describe this image", True),
+    ],
+)
+def test_bagel_step_preprocessor_only_falls_back_for_explicit_text(prompt, use_step_execution):
+    pre_process = get_bagel_pre_process_func(types.SimpleNamespace(step_execution=True))
+    request = OmniDiffusionRequest(
+        prompt=prompt,
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+        request_id="req",
+    )
+
+    assert pre_process(request) is request
+    assert request.use_step_execution is use_step_execution
+
+
+def test_bagel_step_preprocessor_defaults_to_non_step_when_omitted():
+    pre_process = get_bagel_pre_process_func(types.SimpleNamespace())
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "describe this image", "modalities": ["text"]},
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+        request_id="req",
+    )
+
+    assert pre_process(request) is request
+    assert request.use_step_execution is True
 
 
 def _cache(length: int, value: float, num_layers: int = 1) -> NaiveCache:
@@ -108,6 +146,7 @@ def _pipeline_for_prepare(prepared: dict) -> BagelPipeline:
     pipeline = MagicMock()
     pipeline.scheduler = None
     pipeline.scheduler_kwargs = {}
+    pipeline.bagel._sp_size = 1
     pipeline._forward_single.return_value = prepared
     pipeline.bagel.prepare_denoise_schedule.side_effect = lambda latents, steps, shift: Bagel.prepare_denoise_schedule(
         _ScheduleConfig(), latents, steps, shift
@@ -159,6 +198,17 @@ def test_prepare_encode_rejects_zero_step_schedule():
 
     with pytest.raises(ValueError, match="num_inference_steps >= 2"):
         pipeline.prepare_encode(state)
+
+
+def test_prepare_encode_rejects_sequence_parallel_before_forward():
+    pipeline = _pipeline_for_prepare(_prepared_context())
+    pipeline.bagel._sp_size = 2
+    state = StepRequestState(request_id="req", sampling=_sampling(), prompt="draw a cat")
+
+    with pytest.raises(NotImplementedError, match="does not currently support sequence parallelism"):
+        pipeline.prepare_encode(state)
+
+    pipeline._forward_single.assert_not_called()
 
 
 def test_step_protocol_is_enabled_for_bagel():
@@ -273,6 +323,68 @@ def test_denoise_step_dispatches_three_cfg_parallel_branches():
     assert call["do_true_cfg"]
     assert len(call["branches_kwargs"]) == 3
     assert call["true_cfg_scale"]["cfg_vae_lengths"] == [4, 4]
+
+
+def test_denoise_step_allows_idle_cfg_rank_for_two_branches():
+    states = [
+        _prepare_state("a", kv_len=2, cfg_text_scale=4.0),
+        _prepare_state("b", kv_len=3, cfg_text_scale=4.0),
+    ]
+    for state in states:
+        state.extra["bagel_gen_params"].cfg_img_scale = 1.0
+    input_batch = InputBatch.make_batch(states)
+    expected = torch.ones_like(input_batch.latents)
+
+    pipeline = MagicMock()
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config.dtype = torch.float32
+    pipeline.bagel.parallel_config = _ParallelConfig(cfg_parallel_size=3)
+    pipeline.bagel.predict_noise_with_multi_branch_cfg.return_value = expected
+    pipeline._pack_step_generation_inputs = BagelPipeline._pack_step_generation_inputs
+    pipeline._build_denoise_kwargs = types.MethodType(BagelPipeline._build_denoise_kwargs, pipeline)
+    pipeline._denoise_step_cfg_parallel = types.MethodType(BagelPipeline._denoise_step_cfg_parallel, pipeline)
+    pipeline.denoise_step = types.MethodType(BagelPipeline.denoise_step, pipeline)
+    cfg_group = MagicMock()
+
+    with (
+        patch(
+            "vllm_omni.diffusion.models.bagel.pipeline_bagel.get_classifier_free_guidance_world_size",
+            return_value=3,
+        ),
+        patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.get_cfg_group", return_value=cfg_group),
+    ):
+        actual = pipeline.denoise_step(input_batch, states=states)
+
+    assert actual is expected
+    call = pipeline.bagel.predict_noise_with_multi_branch_cfg.call_args.kwargs
+    assert len(call["branches_kwargs"]) == 2
+
+
+def test_denoise_step_rejects_three_cfg_branches_on_two_ranks():
+    states = [
+        _prepare_state("a", kv_len=2, cfg_text_scale=4.0),
+        _prepare_state("b", kv_len=3, cfg_text_scale=4.0),
+    ]
+    input_batch = InputBatch.make_batch(states)
+
+    pipeline = MagicMock()
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config.dtype = torch.float32
+    pipeline.bagel.parallel_config = _ParallelConfig(cfg_parallel_size=2)
+    pipeline._pack_step_generation_inputs = BagelPipeline._pack_step_generation_inputs
+    pipeline._build_denoise_kwargs = types.MethodType(BagelPipeline._build_denoise_kwargs, pipeline)
+    pipeline._denoise_step_cfg_parallel = types.MethodType(BagelPipeline._denoise_step_cfg_parallel, pipeline)
+    pipeline.denoise_step = types.MethodType(BagelPipeline.denoise_step, pipeline)
+
+    with (
+        patch(
+            "vllm_omni.diffusion.models.bagel.pipeline_bagel.get_classifier_free_guidance_world_size",
+            return_value=2,
+        ),
+        patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.get_cfg_group", return_value=MagicMock()),
+        pytest.raises(ValueError, match="requires cfg_parallel_size=3"),
+    ):
+        pipeline.denoise_step(input_batch, states=states)
 
 
 @pytest.mark.parametrize("cfg_text_scale", [1.0, 4.0], ids=["no_cfg", "text_cfg"])
@@ -433,6 +545,48 @@ class _ZeroEmbedding(nn.Module):
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         return torch.zeros(values.shape[0], self.hidden_size, device=values.device)
+
+
+@pytest.mark.parametrize(
+    "cfg_kwargs",
+    [
+        {"cfg_text_scale": 3.0},
+        {
+            "cfg_text_scale": 1.0,
+            "cfg_vae_lengths": [2],
+            "cfg_text_scales": [3.0],
+            "cfg_img_scales": [1.0],
+        },
+    ],
+    ids=["scalar-scale", "per-request-scales"],
+)
+def test_bagel_forward_skips_cfg_without_branch_contexts(cfg_kwargs):
+    bagel = Bagel.__new__(Bagel)
+    nn.Module.__init__(bagel)
+    bagel.hidden_size = 2
+    bagel.use_moe = False
+    bagel.language_model = _PositionAddingLanguageModel(hidden_size=2)
+    bagel.latent_pos_embed = _ZeroEmbedding(hidden_size=2)
+    bagel.time_embedder = _ZeroEmbedding(hidden_size=2)
+    bagel.vae2llm = nn.Identity()
+    bagel.llm2vae = nn.Identity()
+
+    result = bagel.forward(
+        x_t=torch.zeros(2, 2),
+        timestep=torch.zeros(2),
+        packed_vae_token_indexes=torch.tensor([1, 2]),
+        packed_vae_position_ids=torch.zeros(2, dtype=torch.long),
+        packed_text_ids=torch.zeros(2, dtype=torch.long),
+        packed_text_indexes=torch.tensor([0, 3]),
+        packed_position_ids=torch.ones(4, dtype=torch.long),
+        packed_seqlens=torch.tensor([4]),
+        past_key_values=NaiveCache(1),
+        cfg_renorm_min=1.0,
+        **cfg_kwargs,
+    )
+
+    assert bagel.language_model.denoise_calls == 1
+    assert torch.equal(result, torch.ones(2, 2))
 
 
 def test_bagel_forward_combines_cfg_per_request_in_one_model_call():

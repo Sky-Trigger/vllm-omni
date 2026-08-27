@@ -859,6 +859,38 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             record_output_peak_memory=True,
         )
 
+    def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run a complete legacy forward for requests excluded from step mode."""
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("A non-step fallback batch cannot contain cached stepwise requests.")
+
+        runner_outputs: list[RunnerOutput] = []
+        for index, new_req in enumerate(scheduler_output.scheduled_new_reqs):
+            try:
+                result = self.execute_model(
+                    new_req.req,
+                    kv_prefetch_job=getattr(scheduler_output, "kv_prefetch_job", None) if index == 0 else None,
+                    diffusion_kv_metadata=new_req.diffusion_kv_metadata,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Non-step fallback execution failed for %s",
+                    new_req.request_id,
+                    exc_info=True,
+                )
+                result = DiffusionOutput(error=str(exc))
+
+            step_index = getattr(new_req.req.sampling_params, "step_index", None)
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=new_req.request_id,
+                    step_index=0 if step_index is None else step_index,
+                    finished=True,
+                    result=result,
+                )
+            )
+        return BatchRunnerOutput.from_list(runner_outputs)
+
     def _execute_stepwise(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -876,6 +908,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     request_id=new_req.req.request_id,
                     metadata=new_req.diffusion_kv_metadata,
                 )
+        non_step_requests = [
+            new_req
+            for new_req in scheduler_output.scheduled_new_reqs
+            if not getattr(new_req.req, "use_step_execution", True)
+        ]
+        if non_step_requests:
+            scheduled_request_count = len(scheduler_output.scheduled_new_reqs) + len(
+                scheduler_output.scheduled_cached_reqs.request_ids
+            )
+            if len(non_step_requests) != scheduled_request_count:
+                raise ValueError("Cannot mix stepwise and non-step fallback requests in one scheduler batch.")
+            return self._execute_non_step_requests(scheduler_output)
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.

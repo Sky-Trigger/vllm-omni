@@ -48,6 +48,9 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # A model preprocessor may keep selected requests on the legacy full-forward
+    # path even when the engine is globally configured for step execution.
+    use_step_execution: bool = True
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

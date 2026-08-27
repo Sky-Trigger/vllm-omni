@@ -2490,13 +2490,17 @@ class Bagel(CFGParallelMixin, nn.Module):
             extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
             extra_inputs["packed_text_indexes"] = packed_text_indexes
 
-        use_cfg = cfg_text_scale > 1.0 or (
-            cfg_text_scales is not None and any(scale > 1.0 for scale in cfg_text_scales)
+        has_cfg_branches = cfg_branch_pids is not None and cfg_branch_caches is not None
+        use_cfg = has_cfg_branches and (
+            cfg_text_scale > 1.0
+            or (cfg_text_scales is not None and any(scale > 1.0 for scale in cfg_text_scales))
         )
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg and cfg_branch_pids is not None and cfg_branch_caches is not None:
+        if use_cfg:
+            assert cfg_branch_pids is not None
+            assert cfg_branch_caches is not None
             num_branches = len(cfg_branch_pids)
             seq_len = int(packed_seqlens.sum())
 
