@@ -2492,8 +2492,7 @@ class Bagel(CFGParallelMixin, nn.Module):
 
         has_cfg_branches = cfg_branch_pids is not None and cfg_branch_caches is not None
         use_cfg = has_cfg_branches and (
-            cfg_text_scale > 1.0
-            or (cfg_text_scales is not None and any(scale > 1.0 for scale in cfg_text_scales))
+            cfg_text_scale > 1.0 or (cfg_text_scales is not None and any(scale > 1.0 for scale in cfg_text_scales))
         )
         cfg_text_v_t = None
         cfg_img_v_t = None
