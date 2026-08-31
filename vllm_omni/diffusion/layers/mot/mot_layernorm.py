@@ -81,7 +81,9 @@ class MoTRMSNorm(CustomOp):
             head_norm=self.head_norm,
             eps=self.variance_epsilon,
         )
-
+    # ------------------------------------------------------------------
+    # NPU fast-path (not implemented yet; reserved for future optimization)
+    # ------------------------------------------------------------------
     def forward_npu(
         self,
         x: torch.Tensor,
