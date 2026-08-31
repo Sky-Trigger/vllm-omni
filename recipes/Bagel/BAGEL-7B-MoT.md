@@ -219,8 +219,12 @@ requests with incompatible image shapes or BAGEL CFG/renormalization settings.
 
 Step execution currently does not support BAGEL sequence parallelism or a
 diffusion cache backend. Do not combine it with BAGEL SP, TeaCache, or
-Cache-DiT. Tensor parallelism and CFG parallelism are separate features; when
-using CFG parallelism, its world size must match the enabled BAGEL CFG branches.
+Cache-DiT. Tensor parallelism and CFG parallelism are separate features. For
+best utilization, match the CFG parallel world size to the number of active
+BAGEL CFG branches. A larger world size is supported, but extra ranks run dummy
+forward passes to participate in collectives and their outputs are ignored.
+BAGEL currently does not support two CFG ranks when three CFG branches are
+active.
 
 For a matched throughput comparison, start the first server with the default
 stage capacity of one and run:
