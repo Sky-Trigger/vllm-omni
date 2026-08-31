@@ -34,6 +34,7 @@ parameters through the pipeline-declared `extra_args` contract.
   [`examples/online_serving/image_to_image/openai_chat_client.py`](../../examples/online_serving/image_to_image/openai_chat_client.py)
 - Default deploy configs:
   [`vllm_omni/deploy/bagel.yaml`](../../vllm_omni/deploy/bagel.yaml),
+  [`vllm_omni/deploy/bagel_think.yaml`](../../vllm_omni/deploy/bagel_think.yaml),
   [`vllm_omni/deploy/bagel_single_stage.yaml`](../../vllm_omni/deploy/bagel_single_stage.yaml)
 
 ## Hardware Support
@@ -119,6 +120,12 @@ python examples/offline_inference/image_to_image/image_edit.py \
 The `--extra-args` JSON forwards BAGEL-specific parameters (e.g. `cfg_text_scale`,
 `cfg_img_scale`, `cfg_interval`, `cfg_renorm_type`) into
 `OmniDiffusionSamplingParams.extra_args` via the model-extras registry.
+For BAGEL img2img, the pipeline derives the generated image size from the input
+image: it preserves the input aspect ratio, aligns dimensions to the latent
+stride, and applies the checkpoint size limit. Explicit `--height` and
+`--width` values do not override that BAGEL-specific resize policy. Step-mode
+admission resolves this effective size before batching so differently shaped
+requests are scheduled separately.
 
 Run text-to-text with the shared understanding example. BAGEL's default
 `bagel.yaml` deploy config is discovered from the checkpoint, so no model-specific
@@ -158,8 +165,19 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 #### Step Execution and Continuous Batching
 
-BAGEL supports step execution for image generation with the single-stage
-topology. Start with one active request when validating correctness:
+BAGEL supports step execution for image generation with all three in-repo
+deploy configs:
+
+- `bagel.yaml`: the flag applies to the Stage 1 diffusion engine; Stage 0
+  remains on the normal autoregressive path.
+- `bagel_think.yaml`: the flag also applies only to the Stage 1 diffusion
+  engine; Thinker decoding in Stage 0 is unchanged.
+- `bagel_single_stage.yaml`: image requests use step execution in Stage 0.
+  Explicit text-output requests keep the existing complete-request path, so
+  `text2text` and `img2text` behavior is unchanged.
+
+Start with one active request when validating correctness. For example, the
+following command uses the single-stage topology:
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT \
@@ -169,9 +187,10 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
   --step-execution
 ```
 
-To let compatible requests share denoising waves, override the stage capacity.
-The deploy file sets `max_num_seqs: 1`, so its per-stage value takes precedence
-over the global `--max-num-seqs` flag:
+To let compatible requests share denoising waves, override the diffusion-stage
+capacity. The deploy files set `max_num_seqs: 1` for their diffusion stages, so
+the per-stage value takes precedence over the global `--max-num-seqs` flag.
+Use Stage 0 for `bagel_single_stage.yaml`:
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT \
@@ -182,10 +201,26 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
   --stage-overrides '{"0":{"max_num_seqs":4}}'
 ```
 
-Step execution currently covers BAGEL image generation in the single-stage
-pipeline; text output is not supported in this mode. Use at least two inference
-steps. BAGEL builds `num_inference_steps - 1` scheduler updates, so a one-step
-request has no denoising iteration to schedule.
+For either two-stage config, use Stage 1 instead:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT \
+  --omni \
+  --port 8091 \
+  --deploy-config vllm_omni/deploy/bagel.yaml \
+  --step-execution \
+  --stage-overrides '{"1":{"max_num_seqs":4}}'
+```
+
+Use at least two inference steps for image requests. BAGEL builds
+`num_inference_steps - 1` scheduler updates, so a one-step image request has no
+denoising iteration to schedule. The scheduler automatically separates
+requests with incompatible image shapes or BAGEL CFG/renormalization settings.
+
+Step execution currently does not support BAGEL sequence parallelism or a
+diffusion cache backend. Do not combine it with BAGEL SP, TeaCache, or
+Cache-DiT. Tensor parallelism and CFG parallelism are separate features; when
+using CFG parallelism, its world size must match the enabled BAGEL CFG branches.
 
 For a matched throughput comparison, start the first server with the default
 stage capacity of one and run:
@@ -210,8 +245,9 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
   --disable-tqdm
 ```
 
-Restart the server with `--stage-overrides
-'{"0":{"max_num_seqs":4}}'`, rerun the same benchmark with
+Restart the single-stage server with `--stage-overrides
+'{"0":{"max_num_seqs":4}}'` (or use Stage 1 for either two-stage config),
+rerun the same benchmark with
 `--output-file /tmp/bagel_step_seq4.json`, and compare completed requests,
 duration, throughput, and latency percentiles. Keep the model, device topology,
 request count, client concurrency, resolution, steps, seed, and warmup settings

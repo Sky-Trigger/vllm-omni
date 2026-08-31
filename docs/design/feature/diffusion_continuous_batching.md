@@ -152,9 +152,13 @@ Queueing and lifecycle metadata remain in the scheduler's request state.
 Current native pipelines that explicitly enable step execution include
 Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
 imply continuous-batching support: Qwen-Image accepts batched step states.
-BAGEL accepts batched step states for image generation with its single-stage
-pipeline and requires at least two inference steps because it schedules
-`num_inference_steps - 1` denoising updates.
+BAGEL accepts batched step states for image generation with its default,
+think-mode, and single-stage deploy configs. Only the diffusion stage uses the
+step protocol in two-stage deployments; explicit single-stage text output
+retains complete-request execution. BAGEL requires at least two inference steps
+because it schedules `num_inference_steps - 1` denoising updates, and its step
+path does not currently support sequence parallelism or a diffusion cache
+backend.
 HunyuanImage3 accepts batched step states only when its resolved self-attention
 backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
 Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
