@@ -837,10 +837,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
-        """Step-before update: cleanup finished requests and get/create one running state."""
-        for request_id in scheduler_output.finished_req_ids:
+    def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Retire state and paged-KV rows released by the scheduler wave."""
+        finished_req_ids = scheduler_output.finished_req_ids
+        for request_id in finished_req_ids:
             self.state_cache.pop(request_id, None)
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and finished_req_ids
+        ):
+            self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
+        """Resolve cached state and create state for newly admitted requests."""
 
         resolved: list[StepRequestState] = []
         new_request_ids: list[str] = []
@@ -1020,13 +1031,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Execute one step with explicit validation and profiling policy."""
 
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        # A scheduler wave can release a previous stepwise request while it
+        # admits a full-forward fallback request. Do this before dispatch so
+        # the fallback does not bypass normal state/KV retirement.
+        self._cleanup_finished_step_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
-            if validate_kv_metadata:
-                self._validate_diffusion_kv_metadata(
-                    request_id=new_req.req.request_id,
-                    metadata=new_req.diffusion_kv_metadata,
-                )
         non_step_requests = [
             new_req
             for new_req in scheduler_output.scheduled_new_reqs
@@ -1038,7 +1048,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
             if len(non_step_requests) != scheduled_request_count:
                 raise ValueError("Cannot mix stepwise and non-step fallback requests in one scheduler batch.")
+            # This wave has no stepwise requests, so the previous batch cannot
+            # be reused and must not keep its step tensors alive.
+            self.input_batch = None
             return self._execute_non_step_requests(scheduler_output)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if validate_kv_metadata:
+                self._validate_diffusion_kv_metadata(
+                    request_id=new_req.req.request_id,
+                    metadata=new_req.diffusion_kv_metadata,
+                )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
@@ -1049,15 +1068,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
-        # step. Paged rows are retired here for scheduler-finished requests so
-        # a subsequent wave can reuse the native table slots. Dense execution
-        # must not issue Worker KV cleanup side effects.
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and scheduler_output.finished_req_ids
-        ):
-            self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
+        # step. Finished-state retirement is shared with full-forward
+        # fallback dispatch above.
         installed_request_ids: list[str] = []
         try:
             for new_req in scheduler_output.scheduled_new_reqs:

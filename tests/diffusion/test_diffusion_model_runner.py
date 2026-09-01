@@ -11,6 +11,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -257,6 +258,43 @@ def test_execute_stepwise_falls_back_to_full_forward_without_creating_step_state
     assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
     assert runner.pipeline.last_req.num_reqs == 1
     assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypatch):
+    """A finished step request must not survive into a text fallback wave."""
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestDiffusionOutputPipeline()
+    runner.state_cache = {"aborted-step-request": object()}
+    old_step_batch = object()
+    runner.input_batch = old_step_batch
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    runner.remove_diffusion_kv_requests = Mock()
+
+    text_request = _make_request()
+    text_request.request_id = "text-fallback-request"
+    text_request.use_step_execution = False
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"aborted-step-request"},
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=text_request.request_id,
+                req=text_request,
+                diffusion_kv_metadata=None,
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert result.get_request_output(text_request.request_id).finished is True
+    assert runner.state_cache == {}
+    runner.remove_diffusion_kv_requests.assert_called_once_with(["aborted-step-request"])
+    assert runner.input_batch is None
 
 
 @pytest.mark.core_model

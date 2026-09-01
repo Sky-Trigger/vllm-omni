@@ -1141,10 +1141,7 @@ class DiffusionEngine:
             height=512,
             width=512,
             guidance_scale=0.0,
-            # Step execution must exercise at least one denoising iteration.
-            # Some pipelines (for example BAGEL) perform
-            # ``num_inference_steps - 1`` scheduler updates.
-            num_inference_steps=2 if self.step_execution else 1,
+            num_inference_steps=1,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")
