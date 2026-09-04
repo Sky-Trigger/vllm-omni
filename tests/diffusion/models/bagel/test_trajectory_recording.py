@@ -19,14 +19,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
-EXPECTED_STEPS = NUM_TIMESTEPS
+# Official BAGEL samples num_timesteps points then drops the terminal t=0,
+# yielding num_timesteps - 1 denoise steps.
+EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
 def _make_mock_bagel(mocker: MockerFixture):
     """Create a mock Bagel with forward returning constant velocity."""
     mock = mocker.MagicMock(spec=Bagel)
     mock._sp_size = 1
-    mock._denoise_schedule_extra_step = True
+    # MagicMock would otherwise auto-return a truthy stub for this flag; pin it
+    # to the official BAGEL schedule convention (num_timesteps points).
+    mock._denoise_schedule_extra_step = False
 
     # forward returns a small constant velocity so x_t changes each step
     def fake_forward(self, x_t, **kwargs):
@@ -178,7 +182,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Recompute the expected timestep schedule (mirrors generate_image logic)
-        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
+        ts = torch.linspace(1, 0, args["num_timesteps"])
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         expected_timesteps = ts[:-1]  # last element is dropped
@@ -196,7 +200,7 @@ class TestTrajectoryRecording:
         bagel, args = bagel_and_args
 
         # Compute the number of denoising steps the same way generate_image does
-        ts = torch.linspace(1, 0, args["num_timesteps"] + 1)
+        ts = torch.linspace(1, 0, args["num_timesteps"])
         shift = args.get("timestep_shift", 1.0)
         ts = shift * ts / (1 + (shift - 1) * ts)
         num_steps = len(ts) - 1  # timesteps = ts[:-1]
