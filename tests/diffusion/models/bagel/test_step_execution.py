@@ -264,7 +264,7 @@ def test_prepare_encode_populates_request_local_state_and_schedule():
     assert "packed_init_noises" not in state.extra["bagel_generation_input"]
 
 
-def test_prepare_encode_rejects_zero_step_schedule():
+def test_prepare_encode_rejects_one_step_schedule():
     prepared = _prepared_context()
     prepared["gen_params"].num_timesteps = 1
     pipeline = _pipeline_for_prepare(prepared)
@@ -272,6 +272,20 @@ def test_prepare_encode_rejects_zero_step_schedule():
 
     with pytest.raises(ValueError, match="num_inference_steps >= 2"):
         pipeline.prepare_encode(state)
+
+
+def test_lance_style_extra_schedule_point_supports_one_denoising_update():
+    latents = torch.zeros(1, 3)
+
+    timesteps, dts = Bagel.prepare_denoise_schedule(
+        _ScheduleConfig(_denoise_schedule_extra_step=True),
+        latents,
+        num_timesteps=1,
+        timestep_shift=1.0,
+    )
+
+    assert len(timesteps) == 1
+    assert len(dts) == 1
 
 
 def test_prepare_encode_rejects_sequence_parallel_before_forward():

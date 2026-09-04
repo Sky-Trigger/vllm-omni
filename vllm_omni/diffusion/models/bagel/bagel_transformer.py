@@ -1270,6 +1270,8 @@ class Bagel(CFGParallelMixin, nn.Module):
         timestep_shift: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build BAGEL's flow-matching timesteps and per-step deltas."""
+        if num_timesteps < 2 and not self._denoise_schedule_extra_step:
+            raise ValueError("BAGEL image generation requires num_inference_steps >= 2.")
         num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
         schedule = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         schedule = timestep_shift * schedule / (1 + (timestep_shift - 1) * schedule)
